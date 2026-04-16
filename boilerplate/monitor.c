@@ -224,7 +224,7 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
         mutex_lock(&monitor_lock);
 
-        // Optional: prevent duplicate entries
+    
         list_for_each_entry(tmp, &monitor_list, list) {
             if (tmp->pid == req.pid) {
                 mutex_unlock(&monitor_lock);
@@ -243,7 +243,7 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         return 0;
     }
 
-    // UNREGISTER
+    
     mutex_lock(&monitor_lock);
 
     list_for_each_entry_safe(entry, tmp, &monitor_list, list)
