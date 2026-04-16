@@ -457,6 +457,13 @@ static void handle_sigchld(int sig) {
     int status;
     while (waitpid(-1, &status, WNOHANG) > 0);
 }
+static volatile sig_atomic_t stop_flag = 0;
+
+static void handle_sigint(int sig) {
+    (void)sig;
+    stop_flag = 1;
+}
+
 static int run_supervisor(const char *rootfs)
 {
     supervisor_ctx_t ctx;
@@ -492,6 +499,9 @@ static int run_supervisor(const char *rootfs)
 
     // 1. open monitor
     ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
+    if (ctx.monitor_fd < 0) {
+        perror("monitor open failed (continuing without monitor)");
+    }
     
     // 2. create socket
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -519,26 +529,36 @@ static int run_supervisor(const char *rootfs)
     
     // 3. signals
     signal(SIGCHLD, handle_sigchld);
+    signal(SIGINT, handle_sigint);
+    signal(SIGTERM, handle_sigint);
     
     // 4. logger thread
     mkdir(LOG_DIR, 0755);
     pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
     
     // 5. event loop
+    ctx.should_stop = 0;
     while (!ctx.should_stop) {
+    ctx.should_stop = stop_flag;
     int cfd = accept(ctx.server_fd, NULL, NULL);
     if (cfd < 0) continue;
 
     char buffer[512] = {0};
-    read(cfd, buffer, sizeof(buffer) - 1);
+    ssize_t n = read(cfd, buffer, sizeof(buffer) - 1);   
+    if (n <= 0) {
+        close(cfd);
+        continue;
+    }
+    buffer[n] = '\0';
 
     char cmd[16]={0}, id[32]={0}, rootfs[128]={0}, exec_cmd[256]={0};
-    sscanf(buffer, "%s %s %s %[^\n]", cmd, id, rootfs, exec_cmd);
+    sscanf(buffer, "%15s %31s %127s %255[^\n]",   
+           cmd, id, rootfs, exec_cmd);
 
     control_response_t resp;
     memset(&resp, 0, sizeof(resp));
 
-    if (strcmp(cmd, "1") == 0 || strcmp(cmd, "START") == 0) {
+    if (strcmp(cmd, "1") == 0 ) {
 
         int pipefd[2];
         pipe(pipefd);
@@ -557,6 +577,7 @@ static int run_supervisor(const char *rootfs)
 
         if (pid < 0) {
             snprintf(resp.message, sizeof(resp.message), "clone failed");
+            free(stack);
         } else {
             close(pipefd[1]);
 
@@ -566,37 +587,53 @@ static int run_supervisor(const char *rootfs)
             c->state = CONTAINER_RUNNING;
             c->started_at = time(NULL);
 
+            if (ctx.monitor_fd >= 0) {   
+            if (register_with_monitor(ctx.monitor_fd, id, pid,
+                DEFAULT_SOFT_LIMIT, DEFAULT_HARD_LIMIT) < 0) {
+                perror("monitor register failed");
+            }
+        }           
+
             pthread_mutex_lock(&ctx.metadata_lock);
             c->next = ctx.containers;
             ctx.containers = c;
             pthread_mutex_unlock(&ctx.metadata_lock);
 
             pthread_t t;
-            int *fd = malloc(sizeof(int));
-            *fd = pipefd[0];
-
+            typedef struct {
+                int fd;
+                char id[CONTAINER_ID_LEN];
+            } reader_arg_t;
+            
+            reader_arg_t *rarg = malloc(sizeof(*rarg));
+            rarg->fd = pipefd[0];
+            strncpy(rarg->id, id, CONTAINER_ID_LEN - 1);
+            rarg->id[CONTAINER_ID_LEN - 1] = '\0';
+            
             pthread_create(&t, NULL, (void *(*)(void *))({
-                void *fn(void *arg) {
-                    int fd = *(int *)arg;
-                    free(arg);
-
-                    char buf[LOG_CHUNK_SIZE];
-                    ssize_t n;
-
-                    while ((n = read(fd, buf, sizeof(buf))) > 0) {
-                        log_item_t item;
-                        memset(&item, 0, sizeof(item));
-                        strcpy(item.container_id, id);
-                        memcpy(item.data, buf, n);
-                        item.length = n;
-
-                        bounded_buffer_push(&ctx.log_buffer, &item);
-                    }
-                    close(fd);
-                    return NULL;
+            void *fn(void *arg) {
+                reader_arg_t *r = arg;
+        
+                char buf[LOG_CHUNK_SIZE];
+                ssize_t n;
+        
+                while ((n = read(r->fd, buf, sizeof(buf))) > 0) {
+                    log_item_t item;
+                    memset(&item, 0, sizeof(item));
+        
+                    strncpy(item.container_id, r->id, CONTAINER_ID_LEN - 1);
+                    memcpy(item.data, buf, n);
+                    item.length = n;
+        
+                    bounded_buffer_push(&ctx.log_buffer, &item);
                 }
-                fn;
-            }), fd);
+        
+                close(r->fd);
+                free(r);
+                return NULL;
+            }
+            fn;
+        }), rarg);
 
             pthread_detach(t);
 
@@ -610,9 +647,9 @@ static int run_supervisor(const char *rootfs)
 
         for (container_record_t *c = ctx.containers; c; c = c->next) {
             char line[128];
-            sprintf(line, "%s PID:%d STATE:%d\n",
-                    c->id, c->host_pid, c->state);
-            strcat(out, line);
+            sprintf(line, "%s PID:%d STATE:%s\n",
+                    c->id, c->host_pid, state_to_string(c->state));
+            strncat(out, line, sizeof(out) - strlen(out) - 1);
         }
 
         pthread_mutex_unlock(&ctx.metadata_lock);
@@ -625,7 +662,11 @@ static int run_supervisor(const char *rootfs)
         for (container_record_t *c = ctx.containers; c; c = c->next) {
             if (strcmp(c->id, id) == 0) {
                 kill(c->host_pid, SIGKILL);
-                c->state = CONTAINER_STOPPED;
+
+                unregister_from_monitor(ctx.monitor_fd,
+                        c->id,
+                        c->host_pid);
+                        c->state = CONTAINER_STOPPED;
             }
         }
 
@@ -635,7 +676,7 @@ static int run_supervisor(const char *rootfs)
 
     else if (strcmp(cmd, "4") == 0) {
         char path[128];
-        sprintf(path, "logs/%s.log", id);
+        snprintf(path, sizeof(path) ,"logs/%s.log", id);
 
         FILE *f = fopen(path, "r");
         if (f) {
@@ -645,13 +686,17 @@ static int run_supervisor(const char *rootfs)
             strcpy(resp.message, "No logs");
         }
     }
-
+   
     write(cfd, &resp, sizeof(resp));
     close(cfd);
 }
-        fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
-    
+
         bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        pthread_join(ctx.logger_thread, NULL);
+        close(ctx.server_fd);
+        if (ctx.monitor_fd >= 0) close(ctx.monitor_fd);
+        unlink(CONTROL_PATH);
+
         bounded_buffer_destroy(&ctx.log_buffer);
         pthread_mutex_destroy(&ctx.metadata_lock);
         return 1;
